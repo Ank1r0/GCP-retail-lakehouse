@@ -1,0 +1,28 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Env files (contain passwords and project IDs)
+envs/*.env
+.env
+*.env
+
+# GCP credentials (never commit these)
+*.json
+
+# dbt
+dbt/target/
+dbt/logs/
+dbt/dbt_packages/
+
+# Spark
+spark/logs/
+
+# OS
+.DS_Store
+Thumbs.db
