@@ -72,6 +72,23 @@ ALL_TABLES = list(TABLE_CONFIG.keys())
 # ------------------------------------------------------------------
 
 def load_watermarks(client: storage.Client) -> dict:
+    """Load the watermark file from GCS.
+
+    The watermark file is a JSON object that remembers the highest
+    updated_at / payment_date / order_item_id seen in the previous run
+    for each table. On the next run we only fetch rows newer than that
+    value, so we never re-extract rows we already have.
+
+    If the file does not exist yet (first ever run), returns an empty
+    dict — which causes read_table() to do a full extract of everything.
+
+    Example watermarks.json content:
+        {
+          "customers": "2026-05-14 10:30:00",
+          "orders":    "2026-05-14 10:30:00",
+          "order_items": "9847"
+        }
+    """
     blob = client.bucket(GCS_BUCKET).blob(WATERMARK_BLOB)
     if not blob.exists():
         return {}
@@ -79,6 +96,14 @@ def load_watermarks(client: storage.Client) -> dict:
 
 
 def save_watermarks(client: storage.Client, watermarks: dict) -> None:
+    """Persist updated watermarks back to GCS after a successful run.
+
+    Only called at the very end of main() and only when at least one
+    table was uploaded. This guarantees that a failed mid-run does not
+    advance the watermark — the next run will safely re-extract the
+    same rows (idempotent because the blob path includes the run
+    timestamp, so re-uploading just overwrites the same file).
+    """
     blob = client.bucket(GCS_BUCKET).blob(WATERMARK_BLOB)
     blob.upload_from_string(
         json.dumps(watermarks, indent=2, default=str),
@@ -92,6 +117,13 @@ def save_watermarks(client: storage.Client, watermarks: dict) -> None:
 # ------------------------------------------------------------------
 
 def pg_connect():
+    """Open a connection to Postgres using credentials from the env file.
+
+    Returns a psycopg2 connection object. The caller is responsible for
+    closing it. All connection parameters come from environment variables
+    loaded at the top of the module (PG_HOST, PG_PORT, etc.), which in
+    turn come from envs/dev.env or envs/prod.env depending on DOTENV_PATH.
+    """
     return psycopg2.connect(
         host=PG_HOST, port=PG_PORT, dbname=PG_DATABASE,
         user=PG_USER, password=PG_PASSWORD,
@@ -99,7 +131,33 @@ def pg_connect():
 
 
 def read_table(conn, table: str, watermarks: dict, full: bool):
-    """Returns (cols, rows, new_watermark_value)."""
+    """Query one table from Postgres and return only the rows we need.
+
+    Three possible extraction modes, chosen automatically per table:
+
+    1. Full extract (categories, suppliers, or --full flag):
+       SELECT * FROM retail.<table>
+       Used for small lookup tables that have no updated_at column and
+       change rarely. Simpler to just reload them completely each time.
+
+    2. First-ever incremental run (no watermark saved yet):
+       SELECT * FROM retail.<table> ORDER BY <incremental_col>
+       Fetches everything so we have a baseline, then saves the max
+       value as the starting watermark for future runs.
+
+    3. Incremental run (watermark exists):
+       SELECT * FROM retail.<table> WHERE <col> > <last_value>
+       Only fetches rows added or updated since the previous run.
+       Works for both timestamp columns (updated_at, payment_date)
+       and integer PK columns (order_item_id — no updated_at on that
+       table, but items are never updated so the PK is a safe proxy).
+
+    Returns:
+        cols           — list of column names (used as CSV header)
+        rows           — list of tuples (one per row)
+        new_watermark  — the highest value seen in this batch,
+                         or None for full-extract tables
+    """
     cfg = TABLE_CONFIG[table]
 
     if cfg.get("full_extract") or full:
@@ -140,6 +198,17 @@ def read_table(conn, table: str, watermarks: dict, full: bool):
 # ------------------------------------------------------------------
 
 def rows_to_csv_gz(cols: list, rows: list) -> bytes:
+    """Serialise query results to a gzipped CSV byte string.
+
+    The first row is the header (column names). All values are written
+    using Python's csv module with QUOTE_MINIMAL — only quotes fields
+    that contain the delimiter, a quote character, or a newline.
+
+    Returns raw bytes ready to be uploaded directly to GCS without
+    writing a temporary file to disk. Keeping it in memory is fine
+    for tables up to a few hundred MB; for larger tables Parquet would
+    be more efficient but requires pyarrow.
+    """
     buf    = io.StringIO()
     writer = csv.writer(buf, quoting=csv.QUOTE_MINIMAL)
     writer.writerow(cols)
@@ -148,6 +217,23 @@ def rows_to_csv_gz(cols: list, rows: list) -> bytes:
 
 
 def upload(cols: list, rows: list, table: str, run_ts: str, dry_run: bool) -> str:
+    """Upload one table's rows as a gzipped CSV file to GCS.
+
+    The destination path follows the Hive-partitioning convention so
+    BigQuery can use it as a partition filter:
+        bronze/retail__<table>/dt=YYYY-MM-DD/run=YYYYMMDD_HHMM.csv.gz
+
+    - dt=   is the calendar date of this run (used by BQ as a DATE partition).
+    - run=  is the full timestamp, making the blob name unique per minute.
+             Re-running at the same minute overwrites the same blob,
+             so the operation is idempotent.
+
+    In dry-run mode the path is printed but nothing is uploaded,
+    which is useful for verifying GCP connectivity and table config
+    without touching any data.
+
+    Returns the full gs:// URI of the uploaded (or would-be) file.
+    """
     dt        = run_ts[:8]
     date_str  = f"{dt[:4]}-{dt[4:6]}-{dt[6:]}"
     blob_path = f"{BRONZE}/retail__{table}/dt={date_str}/run={run_ts}.csv.gz"
@@ -172,6 +258,22 @@ def upload(cols: list, rows: list, table: str, run_ts: str, dry_run: bool) -> st
 # ------------------------------------------------------------------
 
 def main():
+    """Entry point — parse CLI args and run the extraction pipeline.
+
+    Orchestrates the full flow:
+      1. Parse --table / --all / --dry-run / --full flags.
+      2. Generate a run timestamp (YYYYMMDD_HHMM) shared across all tables
+         so every file from this run sorts together in GCS.
+      3. Load watermarks from GCS so we know where each table left off.
+      4. Connect to Postgres.
+      5. For each target table: read new rows, upload to GCS, record new watermark.
+      6. Save updated watermarks to GCS (only if something was uploaded).
+
+    Watermarks are saved only after all tables succeed. If the script
+    crashes mid-run, the watermark stays at the previous value and the
+    next run re-extracts the same rows — safe because blob names are
+    deterministic (same run_ts = same blob path = overwrite).
+    """
     parser = argparse.ArgumentParser(description="Incremental Postgres -> GCS bronze extractor")
     group  = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--table",   choices=ALL_TABLES)
